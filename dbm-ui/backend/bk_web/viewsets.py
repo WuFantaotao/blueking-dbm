@@ -80,26 +80,36 @@ class GenericMixin:
             serializer = self.get_serializer_class()
         return self.params_validate(serializer, data)
 
-    def replace_empty_value(self, value):
-        if value == "__empty__":
-            return ""
+    # 列表元素的特殊标记 key，用于标识当前处理的是列表中的元素
+    _LIST_ITEM_KEY = "__list_item__"
+    # 空值时返回 "__empty__" 的 key 集合
+    _EMPTY_PLACEHOLDER_KEYS = {"id", "bk_sub_zone_id", "bk_biz_id", "spec_id"}
+    # 空值时返回 "未知" 的 key 集合
+    _UNKNOWN_KEYS = {"name", "value", "city_name", "bk_sub_zone", "text", "device_type", "spec_name"}
 
-        if isinstance(value, QueryDict):
-            qd = value.copy()  # 可变副本
-            for k, vals in qd.lists():
-                qd.setlist(k, [self.replace_empty_value(v) for v in vals])
-            return qd
+    @classmethod
+    def _convert_none_and_empty(cls, data, key=""):
+        # 处理 None 或空字符串：只对特定 key 做转换，其他 key 保持原样
+        if data is None or data == "":
+            if key in cls._EMPTY_PLACEHOLDER_KEYS:
+                return "__empty__"
+            # 特定 key 或列表元素的空值，转为 "未知"
+            if key in cls._UNKNOWN_KEYS or key == cls._LIST_ITEM_KEY:
+                return "未知"
+            # 其他 key 的空值不做转换，保持原样
+            return data
 
-        if isinstance(value, dict):
-            return {k: self.replace_empty_value(v) for k, v in value.items()}
+        if isinstance(data, dict):
+            return {k: cls._convert_none_and_empty(v, k) for k, v in data.items()}
 
-        if isinstance(value, list):
-            return [self.replace_empty_value(item) for item in value]
+        if isinstance(data, list):
+            # 递归处理列表元素，传入列表元素标记 key
+            return [cls._convert_none_and_empty(item, cls._LIST_ITEM_KEY) for item in data]
 
-        if isinstance(value, tuple):
-            return tuple(self.replace_empty_value(item) for item in value)
+        if isinstance(data, tuple):
+            return tuple(cls._convert_none_and_empty(item) for item in data)
 
-        return value
+        return data
 
     def params_validate(self, slz_cls, context: Optional[Dict] = None, init_params: Optional[Dict] = None, **kwargs):
         """
@@ -123,7 +133,7 @@ class GenericMixin:
         if kwargs:
             req_data.update(kwargs)
 
-        req_data = self.replace_empty_value(req_data)
+        req_data = self._convert_none_and_empty(req_data)
 
         # 增加slz的上下文
         slz_context = {"request": self.request, "view": self}
