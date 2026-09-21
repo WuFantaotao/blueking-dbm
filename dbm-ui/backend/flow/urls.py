@@ -111,6 +111,7 @@ from backend.flow.views.mongodb_scene import (
     MongoDBIncreaseMongoSView,
     MongoDBIncreaseNodeView,
     MongoDBInstanceDeInstallView,
+    MongoDBInstanceEnsureStartView,
     MongoDBInstanceFixStatusView,
     MongoDBInstanceMigrateView,
     MongoDBInstanceRestartView,
@@ -191,6 +192,8 @@ from backend.flow.views.name_service import (
     PolarisCreateSceneApiView,
     PolarisDeleteSceneApiView,
 )
+from backend.flow.views.oracle_add_slave import OracleAddSlaveApiView
+from backend.flow.views.oracle_add_slave_via_cascading import OracleAddSlaveViaCascadingApiView
 from backend.flow.views.oracle_scene import MultiOracleExecuteScriptApiView
 from backend.flow.views.pulsar_apply import InstallPulsarSceneApiView
 from backend.flow.views.pulsar_destroy import DestroyPulsarSceneApiView
@@ -412,6 +415,7 @@ urlpatterns = [
     url(r"^scene/multi_cluster_delete_user$", MongoDBDeleteUserView.as_view()),
     url(r"^scene/multi_cluster_exec_script$", MongoDBExecScriptView.as_view()),
     url(r"^scene/multi_instance_restart$", MongoDBInstanceRestartView.as_view()),
+    url(r"^scene/mongo_instance_ensure_start$", MongoDBInstanceEnsureStartView.as_view()),
     url(r"^scene/multi_hosts_replace$", MongoDBReplaceView.as_view()),
     url(r"^scene/multi_cluster_increase_mongos$", MongoDBIncreaseMongoSView.as_view()),
     url(r"^scene/multi_cluster_reduce_mongos$", MongoDBReduceMongoSView.as_view()),
@@ -431,6 +435,8 @@ urlpatterns = [
     # mongodb end
     # oracle start
     url(r"^scene/multi_oracle_execute_script$", MultiOracleExecuteScriptApiView.as_view()),
+    url(r"^scene/oracle_add_slave$", OracleAddSlaveApiView.as_view()),
+    url(r"^scene/oracle_add_slave_via_cascading$", OracleAddSlaveViaCascadingApiView.as_view()),
     # oracle end
     # mysql upgrade
     url(r"^scene/upgrade_mysql_proxy$", UpgradeMySQLProxySceneApiView.as_view()),

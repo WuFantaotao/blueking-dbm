@@ -7,6 +7,7 @@ from django.conf import settings
 from django.test import SimpleTestCase
 
 from backend.db_meta.enums import ClusterType, TenDBClusterSpiderRole
+from backend.db_services.mysql.remote_service.exceptions import RemoteServiceBaseException
 from backend.flow.signal.callback_map import TICKET_TYPE_HANDLERS
 from backend.flow.utils.mysql.dts.constants import DtsLifecycleMode, FullLoadEngine, MigrateTopology, MigrateType
 from backend.flow.utils.mysql.dts.migrate_plan import normalize_migrate_ticket_details
@@ -102,7 +103,7 @@ def _minimal_layered_details(**overrides):
         "migrate": {
             "topology": MigrateTopology.ONE_TO_ONE.value,
             "one_to_one": {
-                "source": {"cluster_id": 100, "sync_scope": {"do_dbs": ["db_a"]}},
+                "source": {"cluster_id": 100, "sync_scope": {"db_patterns": ["db_a"], "table_patterns": ["*"]}},
                 "target": {"cluster_id": 200},
             },
         },
@@ -115,11 +116,12 @@ def _minimal_layered_details(**overrides):
     return data
 
 
-def _one_to_one_migrate(src, dst, do_dbs=None, table_routes=None):
+def _one_to_one_migrate(src, dst, db_patterns=None, table_routes=None, table_patterns=None):
     source = {"cluster_id": src}
     sync_scope = {}
-    if do_dbs is not None:
-        sync_scope["do_dbs"] = list(do_dbs)
+    if db_patterns is not None:
+        sync_scope["db_patterns"] = list(db_patterns)
+        sync_scope["table_patterns"] = list(table_patterns) if table_patterns is not None else ["*"]
     if table_routes is not None:
         sync_scope["table_routes"] = list(table_routes)
     if sync_scope:
@@ -161,12 +163,23 @@ def _grant_cluster_filter_side_effect(*args, **kwargs):
 class MysqlDtsTicketSerializerTest(SimpleTestCase):
     def setUp(self):
         super().setUp()
-        patcher = patch(
+        cluster_patcher = patch(
             "backend.ticket.builders.mysql.dts.mysql_dts_tickets.Cluster.objects.filter",
             side_effect=_grant_cluster_filter_side_effect,
         )
-        self.addCleanup(patcher.stop)
-        patcher.start()
+        db_patcher = patch(
+            "backend.ticket.builders.mysql.dts.mysql_dts_tickets.RemoteServiceHandler.show_database_with_pattern",
+            return_value=["db_a"],
+        )
+        table_patcher = patch(
+            "backend.ticket.builders.mysql.dts.mysql_dts_tickets.RemoteServiceHandler.show_table_with_pattern",
+            return_value=["tb_a"],
+        )
+        for patcher in (cluster_patcher, db_patcher, table_patcher):
+            self.addCleanup(patcher.stop)
+        cluster_patcher.start()
+        self.mock_show_databases = db_patcher.start()
+        self.mock_show_tables = table_patcher.start()
 
     def test_migrate_serializer_builds_plan(self):
         slz = MysqlMigrateBaseDetailSerializer(data=_minimal_layered_details())
@@ -179,6 +192,68 @@ class MysqlDtsTicketSerializerTest(SimpleTestCase):
         self.assertEqual(plan.task_specs[0].target_cluster_id, 200)
         # validate 阶段无 ticket.id，允许空 task_name
         self.assertEqual(plan.task_specs[0].task_name, "")
+
+    def test_same_name_omits_unspecified_scope_keys(self):
+        slz = MysqlMigrateBaseDetailSerializer(data=_minimal_layered_details())
+        self.assertTrue(slz.is_valid(), slz.errors)
+        scope = slz.validated_data["migrate"]["one_to_one"]["source"]["sync_scope"]
+        self.assertEqual(scope["db_patterns"], ["db_a"])
+        self.assertEqual(scope["table_patterns"], ["*"])
+        self.assertNotIn("table_routes", scope)
+        self.assertNotIn("binlog_filters", scope)
+        self.assertNotIn("ignore_dbs", scope)
+        self.assertNotIn("ignore_tables", scope)
+
+    def test_same_name_keeps_binlog_filters_when_provided(self):
+        details = _minimal_layered_details()
+        details["migrate"]["one_to_one"]["source"]["sync_scope"]["binlog_filters"] = [
+            {"name": "skip_ddl", "ignore_events": ["query"]}
+        ]
+        slz = MysqlMigrateBaseDetailSerializer(data=details)
+        self.assertTrue(slz.is_valid(), slz.errors)
+        scope = slz.validated_data["migrate"]["one_to_one"]["source"]["sync_scope"]
+        self.assertEqual(scope["binlog_filters"], [{"name": "skip_ddl", "ignore_events": ["query"]}])
+
+    def test_source_database_pattern_matches_nothing_rejected(self):
+        self.mock_show_databases.return_value = []
+        slz = MysqlMigrateBaseDetailSerializer(data=_minimal_layered_details())
+        self.assertFalse(slz.is_valid())
+        self.assertIn("匹配不到任何业务库", str(slz.errors))
+        self.mock_show_tables.assert_not_called()
+
+    def test_source_table_pattern_matches_nothing_rejected(self):
+        details = _minimal_layered_details()
+        details["migrate"]["one_to_one"]["source"]["sync_scope"]["table_patterns"] = ["tb%"]
+        self.mock_show_tables.return_value = []
+        slz = MysqlMigrateBaseDetailSerializer(data=details)
+        self.assertFalse(slz.is_valid())
+        self.assertIn("匹配不到任何业务表", str(slz.errors))
+
+    def test_source_database_and_table_patterns_match_valid(self):
+        details = _minimal_layered_details()
+        details["migrate"]["one_to_one"]["source"]["sync_scope"]["table_patterns"] = ["tb?"]
+        slz = MysqlMigrateBaseDetailSerializer(data=details)
+        self.assertTrue(slz.is_valid(), slz.errors)
+        self.mock_show_tables.assert_called_once_with(100, ["db_a"], ["tb?"], [])
+
+    def test_whole_table_only_checks_database(self):
+        slz = MysqlMigrateBaseDetailSerializer(data=_minimal_layered_details())
+        self.assertTrue(slz.is_valid(), slz.errors)
+        self.mock_show_tables.assert_not_called()
+
+    def test_exact_test_database_is_queried_as_allowed_system_database(self):
+        details = _minimal_layered_details()
+        details["migrate"]["one_to_one"]["source"]["sync_scope"]["db_patterns"] = ["test"]
+        self.mock_show_databases.return_value = ["test"]
+        slz = MysqlMigrateBaseDetailSerializer(data=details)
+        self.assertTrue(slz.is_valid(), slz.errors)
+        self.mock_show_databases.assert_called_once_with(100, ["test"], [], keep_system_dbs=["test"])
+
+    def test_source_object_drs_failure_rejected(self):
+        self.mock_show_databases.side_effect = RemoteServiceBaseException()
+        slz = MysqlMigrateBaseDetailSerializer(data=_minimal_layered_details())
+        self.assertFalse(slz.is_valid())
+        self.assertIn("查询源集群 100 的迁移对象失败", str(slz.errors))
 
     def test_migrate_serializer_without_task_name_valid(self):
         """AE6：无 task_name 入参、无 ticket.id 时结构校验可通过。"""
@@ -384,7 +459,10 @@ class MysqlDtsTicketSerializerTest(SimpleTestCase):
                         migrate={
                             "topology": MigrateTopology.ONE_TO_ONE.value,
                             "one_to_one": {
-                                "source": {"cluster_id": 100, "sync_scope": {"do_dbs": ["db_a"]}},
+                                "source": {
+                                    "cluster_id": 100,
+                                    "sync_scope": {"db_patterns": ["db_a"], "table_patterns": ["*"]},
+                                },
                                 "target": {"cluster_id": 200},
                             },
                         },
@@ -394,7 +472,10 @@ class MysqlDtsTicketSerializerTest(SimpleTestCase):
                         migrate={
                             "topology": MigrateTopology.ONE_TO_ONE.value,
                             "one_to_one": {
-                                "source": {"cluster_id": 100, "sync_scope": {"do_dbs": ["db_b"]}},
+                                "source": {
+                                    "cluster_id": 100,
+                                    "sync_scope": {"db_patterns": ["db_b"], "table_patterns": ["*"]},
+                                },
                                 "target": {"cluster_id": 200},
                             },
                         },
@@ -479,7 +560,7 @@ class MysqlDtsTicketSerializerTest(SimpleTestCase):
         request = SimpleNamespace(
             data={
                 "bk_biz_id": 1,
-                "ticket_type": TicketType.MYSQL_TO_MYSQL_MIGRATE.value,
+                "ticket_type": TicketType.MYSQL_DTS_DATA_MIGRATE.value,
                 "details": details,
             }
         )
@@ -500,7 +581,10 @@ class MysqlDtsTicketSerializerTest(SimpleTestCase):
                     migrate={
                         "topology": MigrateTopology.ONE_TO_ONE.value,
                         "one_to_one": {
-                            "source": {"cluster_id": 100, "sync_scope": {"do_dbs": ["db_b"]}},
+                            "source": {
+                                "cluster_id": 100,
+                                "sync_scope": {"db_patterns": ["db_b"], "table_patterns": ["*"]},
+                            },
                             "target": {"cluster_id": 200},
                         },
                     },
@@ -510,7 +594,7 @@ class MysqlDtsTicketSerializerTest(SimpleTestCase):
         request = SimpleNamespace(
             data={
                 "bk_biz_id": 1,
-                "ticket_type": TicketType.MYSQL_TO_MYSQL_MIGRATE.value,
+                "ticket_type": TicketType.MYSQL_DTS_DATA_MIGRATE.value,
                 "details": details,
             }
         )
@@ -528,7 +612,7 @@ class MysqlDtsTicketSerializerTest(SimpleTestCase):
         request = SimpleNamespace(
             data={
                 "bk_biz_id": 1,
-                "ticket_type": TicketType.MYSQL_TO_MYSQL_MIGRATE.value,
+                "ticket_type": TicketType.MYSQL_DTS_DATA_MIGRATE.value,
                 "details": details,
             }
         )
@@ -676,7 +760,7 @@ class MysqlDtsTicketSerializerTest(SimpleTestCase):
         self.assertIn("重叠", str(slz.errors))
 
     def test_infos_star_db_covers_any_object_rejected(self):
-        """AE5：do_dbs=['*'] 与同源同目标任意对象重叠 → 拒单。"""
+        """AE5：db_patterns=['*'] 与同源同目标任意对象重叠 → 拒单。"""
         slz = MysqlMigrateBaseDetailSerializer(
             data=_infos_ticket(
                 _one_to_one_migrate(100, 200, ["*"]),
@@ -691,6 +775,49 @@ class MysqlDtsTicketSerializerTest(SimpleTestCase):
         slz = MysqlMigrateBaseDetailSerializer(data=_minimal_layered_details(migrate=_one_to_one_migrate(100, 200)))
         self.assertFalse(slz.is_valid())
         self.assertIn("同步范围为空", str(slz.errors))
+
+    def test_same_name_old_do_dbs_rejected(self):
+        data = _minimal_layered_details()
+        data["migrate"]["one_to_one"]["source"]["sync_scope"] = {"do_dbs": ["db_a"]}
+        slz = MysqlToMysqlMigrateDetailSerializer(data=data)
+        self.assertFalse(slz.is_valid())
+        self.assertIn("db_patterns", str(slz.errors))
+
+    def test_same_name_old_do_tables_rejected(self):
+        data = _minimal_layered_details()
+        data["migrate"]["one_to_one"]["source"]["sync_scope"] = {
+            "db_patterns": ["db_a"],
+            "do_tables": [{"schema": "*", "table": "*"}],
+        }
+        slz = MysqlToMysqlMigrateDetailSerializer(data=data)
+        self.assertFalse(slz.is_valid())
+        self.assertIn("db_patterns", str(slz.errors))
+
+    def test_same_name_empty_db_patterns_rejected(self):
+        slz = MysqlToMysqlMigrateDetailSerializer(
+            data=_minimal_layered_details(migrate=_one_to_one_migrate(100, 200, [], table_patterns=["*"]))
+        )
+        self.assertFalse(slz.is_valid())
+        self.assertIn("db_patterns", str(slz.errors))
+
+    def test_same_name_empty_table_patterns_rejected(self):
+        slz = MysqlToMysqlMigrateDetailSerializer(
+            data=_minimal_layered_details(migrate=_one_to_one_migrate(100, 200, ["db_a"], table_patterns=[]))
+        )
+        self.assertFalse(slz.is_valid())
+        self.assertIn("table_patterns", str(slz.errors))
+
+    def test_same_name_embedded_star_rejected(self):
+        slz = MysqlToMysqlMigrateDetailSerializer(
+            data=_minimal_layered_details(migrate=_one_to_one_migrate(100, 200, ["db*"]))
+        )
+        self.assertFalse(slz.is_valid())
+
+    def test_same_name_percent_glob_ok(self):
+        slz = MysqlToMysqlMigrateDetailSerializer(
+            data=_minimal_layered_details(migrate=_one_to_one_migrate(100, 200, ["db%"], table_patterns=["tb%"]))
+        )
+        self.assertTrue(slz.is_valid(), slz.errors)
 
     def test_src_equals_dst_rejected(self):
         """AE7：普通迁移源集群等于目标集群 → 拒单。"""
@@ -719,8 +846,8 @@ class MysqlDtsTicketSerializerTest(SimpleTestCase):
                     "topology": MigrateTopology.MANY_TO_ONE.value,
                     "many_to_one": {
                         "sources": [
-                            {"cluster_id": 100, "sync_scope": {"do_dbs": ["db_a"]}},
-                            {"cluster_id": 101, "sync_scope": {"do_dbs": ["db_a"]}},
+                            {"cluster_id": 100, "sync_scope": {"db_patterns": ["db_a"], "table_patterns": ["*"]}},
+                            {"cluster_id": 101, "sync_scope": {"db_patterns": ["db_a"], "table_patterns": ["*"]}},
                         ],
                         "target": {"cluster_id": 200},
                     },
@@ -834,8 +961,12 @@ class MigrateTargetSpiderSerializerTest(SimpleTestCase):
         self.assertFalse(slz.is_valid())
         self.assertIn("target_spider", slz.errors)
 
+    @patch(
+        "backend.ticket.builders.mysql.dts.mysql_dts_tickets.RemoteServiceHandler.show_database_with_pattern",
+        return_value=["db_a"],
+    )
     @patch("backend.ticket.builders.mysql.dts.mysql_dts_tickets.Cluster.objects.filter")
-    def test_ha_to_cluster_layered_plan_carries_target_spider(self, mock_filter):
+    def test_ha_to_cluster_layered_plan_carries_target_spider(self, mock_filter, _mock_show_databases):
         cluster = _mock_cluster(
             200,
             ClusterType.TenDBCluster.value,
@@ -941,7 +1072,7 @@ class MysqlMigrateFlowParamBuilderUidTest(SimpleTestCase):
         )
 
     def test_mysql_to_mysql_get_params_has_uid(self):
-        builder = MysqlToMysqlMigrateFlowParamBuilder(self._ticket(TicketType.MYSQL_TO_MYSQL_MIGRATE.value))
+        builder = MysqlToMysqlMigrateFlowParamBuilder(self._ticket(TicketType.MYSQL_DTS_DATA_MIGRATE.value))
         params = builder.get_params()
         ticket_data = params["ticket_data"]
         self.assertEqual(ticket_data["uid"], 18801)
@@ -952,7 +1083,7 @@ class MysqlMigrateFlowParamBuilderUidTest(SimpleTestCase):
         self.assertNotIn("migrate_plan", ticket_data)
 
     def test_ha_to_cluster_get_params_has_uid(self):
-        builder = MysqlHaToClusterMigrateFlowParamBuilder(self._ticket(TicketType.MYSQL_HA_TO_CLUSTER_MIGRATE.value))
+        builder = MysqlHaToClusterMigrateFlowParamBuilder(self._ticket(TicketType.MYSQL_DTS_DATA_MIGRATE.value))
         params = builder.get_params()
         ticket_data = params["ticket_data"]
         self.assertEqual(ticket_data["uid"], 18801)
@@ -962,7 +1093,7 @@ class MysqlMigrateFlowParamBuilderUidTest(SimpleTestCase):
         self.assertNotIn("migrate_plan", ticket_data)
 
     def test_rename_get_params_does_not_pin_migrate_type(self):
-        builder = MysqlRenameMigrateFlowParamBuilder(self._ticket(TicketType.MYSQL_RENAME_MIGRATE.value))
+        builder = MysqlRenameMigrateFlowParamBuilder(self._ticket(TicketType.MYSQL_DTS_DATA_MIGRATE_RENAME.value))
         params = builder.get_params()
         ticket_data = params["ticket_data"]
         self.assertEqual(ticket_data["uid"], 18801)
@@ -974,17 +1105,62 @@ class MysqlMigrateFlowParamBuilderUidTest(SimpleTestCase):
 class MysqlRenameMigrateSerializerTest(SimpleTestCase):
     def setUp(self):
         super().setUp()
-        patcher = patch(
+        cluster_patcher = patch(
             "backend.ticket.builders.mysql.dts.mysql_dts_tickets.Cluster.objects.filter",
             side_effect=_rename_cluster_filter_side_effect,
         )
-        self.addCleanup(patcher.stop)
-        patcher.start()
+        db_patcher = patch(
+            "backend.ticket.builders.mysql.dts.mysql_dts_tickets.RemoteServiceHandler.show_database_with_pattern",
+            return_value=["db_old"],
+        )
+        table_patcher = patch(
+            "backend.ticket.builders.mysql.dts.mysql_dts_tickets.RemoteServiceHandler.show_table_with_pattern",
+            return_value=["t_old"],
+        )
+        for patcher in (cluster_patcher, db_patcher, table_patcher):
+            self.addCleanup(patcher.stop)
+        cluster_patcher.start()
+        self.mock_show_databases = db_patcher.start()
+        self.mock_show_tables = table_patcher.start()
 
     def test_db_rename_valid_writes_mysql_to_mysql(self):
         slz = MysqlRenameMigrateDetailSerializer(data=_rename_layered_details())
         self.assertTrue(slz.is_valid(), slz.errors)
         self.assertEqual(slz.validated_data["migrate_type"], MigrateType.MYSQL_TO_MYSQL.value)
+
+    def test_rename_omits_unspecified_route_and_scope_keys(self):
+        slz = MysqlRenameMigrateDetailSerializer(data=_rename_layered_details())
+        self.assertTrue(slz.is_valid(), slz.errors)
+        scope = slz.validated_data["migrate"]["one_to_one"]["source"]["sync_scope"]
+        self.assertEqual(
+            scope["table_routes"],
+            [{"source_db": "db_old", "source_table": "*", "target_db": "db_new"}],
+        )
+        for key in (
+            "source_name",
+            "source_db_pattern",
+            "source_table_pattern",
+            "target_table",
+        ):
+            self.assertNotIn(key, scope["table_routes"][0])
+        for key in (
+            "db_patterns",
+            "ignore_dbs",
+            "table_patterns",
+            "ignore_tables",
+            "binlog_filters",
+        ):
+            self.assertNotIn(key, scope)
+
+    def test_rename_keeps_binlog_filters_when_provided(self):
+        details = _rename_layered_details()
+        details["migrate"]["one_to_one"]["source"]["sync_scope"]["binlog_filters"] = [
+            {"name": "skip_ddl", "ignore_events": ["query"]}
+        ]
+        slz = MysqlRenameMigrateDetailSerializer(data=details)
+        self.assertTrue(slz.is_valid(), slz.errors)
+        scope = slz.validated_data["migrate"]["one_to_one"]["source"]["sync_scope"]
+        self.assertEqual(scope["binlog_filters"], [{"name": "skip_ddl", "ignore_events": ["query"]}])
 
     def test_table_rename_valid(self):
         slz = MysqlRenameMigrateDetailSerializer(
@@ -1008,6 +1184,36 @@ class MysqlRenameMigrateSerializerTest(SimpleTestCase):
         )
         self.assertTrue(slz.is_valid(), slz.errors)
         self.assertEqual(slz.validated_data["migrate_type"], MigrateType.MYSQL_TO_MYSQL.value)
+
+    def test_rename_source_database_matches_nothing_rejected(self):
+        self.mock_show_databases.return_value = []
+        slz = MysqlRenameMigrateDetailSerializer(data=_rename_layered_details())
+        self.assertFalse(slz.is_valid())
+        self.assertIn("匹配不到任何业务库", str(slz.errors))
+
+    def test_rename_source_object_drs_failure_rejected(self):
+        self.mock_show_databases.side_effect = RemoteServiceBaseException()
+        slz = MysqlRenameMigrateDetailSerializer(data=_rename_layered_details())
+        self.assertFalse(slz.is_valid())
+        self.assertIn("查询源集群 100 的迁移对象失败", str(slz.errors))
+
+    def test_rename_source_table_matches_nothing_rejected(self):
+        details = _rename_layered_details(
+            migrate={
+                "topology": MigrateTopology.ONE_TO_ONE.value,
+                "one_to_one": {
+                    "source": {
+                        "cluster_id": 100,
+                        "sync_scope": _rename_sync_scope(source_table="t_old", target_table="t_new"),
+                    },
+                    "target": {"cluster_id": 200},
+                },
+            }
+        )
+        self.mock_show_tables.return_value = []
+        slz = MysqlRenameMigrateDetailSerializer(data=details)
+        self.assertFalse(slz.is_valid())
+        self.assertIn("匹配不到任何业务表", str(slz.errors))
 
     def test_do_dbs_only_rejected(self):
         slz = MysqlRenameMigrateDetailSerializer(data=_minimal_layered_details())
@@ -1095,16 +1301,16 @@ class MysqlRenameMigrateSerializerTest(SimpleTestCase):
         self.assertIn("落到目标集群", str(slz.errors))
 
     def test_builder_registered(self):
-        self.assertIn(TicketType.MYSQL_RENAME_MIGRATE, BuilderFactory.registry)
+        self.assertIn(TicketType.MYSQL_DTS_DATA_MIGRATE_RENAME, BuilderFactory.registry)
         self.assertEqual(MysqlRenameMigrateFlowBuilder.serializer, MysqlRenameMigrateDetailSerializer)
         self.assertEqual(MysqlRenameMigrateFlowBuilder.inner_flow_builder, MysqlRenameMigrateFlowParamBuilder)
-        self.assertIsNotNone(TICKET_TYPE_HANDLERS.get(TicketType.MYSQL_RENAME_MIGRATE.lower()))
+        self.assertIsNotNone(TICKET_TYPE_HANDLERS.get(TicketType.MYSQL_DTS_DATA_MIGRATE_RENAME.lower()))
 
     def test_rename_iam_includes_mysql_and_tendbcluster(self):
         from backend.iam_app.dataclass.actions import ActionEnum
         from backend.iam_app.dataclass.resources import ResourceEnum
 
-        resources = ActionEnum.MYSQL_RENAME_MIGRATE.related_resource_types
+        resources = ActionEnum.MYSQL_DTS_DATA_MIGRATE.related_resource_types
         self.assertEqual(resources, [ResourceEnum.MYSQL, ResourceEnum.TENDBCLUSTER])
 
     def test_rename_create_ticket_permission_is_mixed_not_more_resource(self):
@@ -1114,7 +1320,7 @@ class MysqlRenameMigrateSerializerTest(SimpleTestCase):
             create_ticket_permission,
         )
 
-        perms = create_ticket_permission(TicketType.MYSQL_RENAME_MIGRATE)
+        perms = create_ticket_permission(TicketType.MYSQL_DTS_DATA_MIGRATE_RENAME)
         self.assertEqual(len(perms), 1)
         self.assertIsInstance(perms[0], CreateTicketMysqlOrTendbclusterPermission)
         self.assertNotIsInstance(perms[0], CreateTicketMoreResourcePermission)
@@ -1137,7 +1343,7 @@ class MysqlRenameMigrateSerializerTest(SimpleTestCase):
         mock_perm_cls.side_effect = [mysql_perm, tendb_perm]
 
         request = SimpleNamespace(data={"details": {"cluster_ids": [100, 201]}})
-        perm = CreateTicketMysqlOrTendbclusterPermission(TicketType.MYSQL_RENAME_MIGRATE)
+        perm = CreateTicketMysqlOrTendbclusterPermission(TicketType.MYSQL_DTS_DATA_MIGRATE_RENAME)
         self.assertTrue(perm.has_permission(request, view=None))
 
         self.assertEqual(mock_perm_cls.call_count, 2)
@@ -1220,7 +1426,10 @@ class MysqlMigrateTaskNamePatchTest(SimpleTestCase):
                     migrate={
                         "topology": MigrateTopology.ONE_TO_ONE.value,
                         "one_to_one": {
-                            "source": {"cluster_id": 100, "sync_scope": {"do_dbs": ["db_a"]}},
+                            "source": {
+                                "cluster_id": 100,
+                                "sync_scope": {"db_patterns": ["db_a"], "table_patterns": ["*"]},
+                            },
                             "target": {"cluster_id": 200},
                         },
                     }
@@ -1230,7 +1439,10 @@ class MysqlMigrateTaskNamePatchTest(SimpleTestCase):
                     migrate={
                         "topology": MigrateTopology.ONE_TO_ONE.value,
                         "one_to_one": {
-                            "source": {"cluster_id": 100, "sync_scope": {"do_dbs": ["db_b"]}},
+                            "source": {
+                                "cluster_id": 100,
+                                "sync_scope": {"db_patterns": ["db_b"], "table_patterns": ["*"]},
+                            },
                             "target": {"cluster_id": 200},
                         },
                     },
@@ -1619,7 +1831,7 @@ class MysqlDtsDestroyAfterMigrateHookTest(SimpleTestCase):
             creator="tester",
             bk_biz_id=1,
             details=_minimal_layered_details(dts_resource=dts_resource),
-            ticket_type=TicketType.MYSQL_TO_MYSQL_MIGRATE.value,
+            ticket_type=TicketType.MYSQL_DTS_DATA_MIGRATE.value,
             config={},
         )
         ticket.add_related_ticket = MagicMock()
@@ -1973,7 +2185,7 @@ class MysqlDtsMigrateSucceededDestroyTriggerTest(SimpleTestCase):
     @patch("backend.ticket.flow_manager.manager.notify.send_msg.apply_async")
     @patch("backend.ticket.flow_manager.manager.add_ticket_audit_event.apply_async")
     def test_succeeded_triggers_destroy_task(self, _mock_audit, _mock_notify, mock_recycle, mock_destroy):
-        manager, ticket = self._manager(TicketType.MYSQL_TO_MYSQL_MIGRATE.value)
+        manager, ticket = self._manager(TicketType.MYSQL_DTS_DATA_MIGRATE.value)
         manager.ticket_status_trigger(TicketStatus.RUNNING, TicketStatus.SUCCEEDED)
         mock_destroy.assert_called_once_with(args=(ticket.id,))
         mock_recycle.assert_not_called()
@@ -1982,7 +2194,7 @@ class MysqlDtsMigrateSucceededDestroyTriggerTest(SimpleTestCase):
     @patch("backend.ticket.flow_manager.manager.notify.send_msg.apply_async")
     @patch("backend.ticket.flow_manager.manager.add_ticket_audit_event.apply_async")
     def test_rename_succeeded_triggers_destroy_task(self, _mock_audit, _mock_notify, mock_destroy):
-        manager, ticket = self._manager(TicketType.MYSQL_RENAME_MIGRATE.value)
+        manager, ticket = self._manager(TicketType.MYSQL_DTS_DATA_MIGRATE_RENAME.value)
         manager.ticket_status_trigger(TicketStatus.RUNNING, TicketStatus.SUCCEEDED)
         mock_destroy.assert_called_once_with(args=(ticket.id,))
 
@@ -2125,9 +2337,9 @@ class MysqlDtsExclusiveTicketMapTest(SimpleTestCase):
     def test_dts_migrate_not_exclusive_with_mysql_checksum_cron(self):
         exclusive_map = self._exclusive_bool_map()
         migrate_types = [
-            TicketType.MYSQL_TO_MYSQL_MIGRATE.value,
+            TicketType.MYSQL_DTS_DATA_MIGRATE.value,
             TicketType.MYSQL_HA_TO_CLUSTER_MIGRATE.value,
-            TicketType.MYSQL_RENAME_MIGRATE.value,
+            TicketType.MYSQL_DTS_DATA_MIGRATE_RENAME.value,
         ]
         checksum = TicketType.MYSQL_CHECKSUM_CRON.value
         for migrate in migrate_types:
@@ -2145,7 +2357,7 @@ class MysqlDtsExclusiveTicketMapTest(SimpleTestCase):
         checksum = TicketType.TENDBCLUSTER_CHECKSUM_CRON.value
         for migrate in (
             TicketType.MYSQL_HA_TO_CLUSTER_MIGRATE.value,
-            TicketType.MYSQL_RENAME_MIGRATE.value,
+            TicketType.MYSQL_DTS_DATA_MIGRATE_RENAME.value,
         ):
             self.assertFalse(exclusive_map[checksum].get(migrate, True))
             self.assertFalse(exclusive_map[migrate].get(checksum, True))
@@ -2153,9 +2365,9 @@ class MysqlDtsExclusiveTicketMapTest(SimpleTestCase):
     def test_dts_migrate_types_exclusive_with_each_other(self):
         exclusive_map = self._exclusive_bool_map()
         types = [
-            TicketType.MYSQL_TO_MYSQL_MIGRATE.value,
+            TicketType.MYSQL_DTS_DATA_MIGRATE.value,
             TicketType.MYSQL_HA_TO_CLUSTER_MIGRATE.value,
-            TicketType.MYSQL_RENAME_MIGRATE.value,
+            TicketType.MYSQL_DTS_DATA_MIGRATE_RENAME.value,
         ]
         for a in types:
             for b in types:
@@ -2166,9 +2378,9 @@ class MysqlDtsExclusiveTicketMapTest(SimpleTestCase):
         exclusive_map = self._exclusive_bool_map()
         checksum = TicketType.MYSQL_DTS_CHECKSUM.value
         migrate_types = [
-            TicketType.MYSQL_TO_MYSQL_MIGRATE.value,
+            TicketType.MYSQL_DTS_DATA_MIGRATE.value,
             TicketType.MYSQL_HA_TO_CLUSTER_MIGRATE.value,
-            TicketType.MYSQL_RENAME_MIGRATE.value,
+            TicketType.MYSQL_DTS_DATA_MIGRATE_RENAME.value,
         ]
         for migrate in migrate_types:
             self.assertFalse(

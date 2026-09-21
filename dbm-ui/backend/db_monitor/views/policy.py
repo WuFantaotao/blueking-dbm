@@ -32,6 +32,7 @@ from backend.configuration.constants import PLAT_BIZ_ID
 from backend.db_meta.enums import ClusterType
 from backend.db_meta.models import AppCache, Cluster, DBModule, ProxyInstance, StorageInstance, TenDBClusterSpiderExt
 from backend.db_monitor import constants, serializers
+from backend.db_monitor.handlers import get_policy_threshold
 from backend.db_monitor.models import MonitorPolicy
 from backend.db_monitor.views.callbacks import mysql  # noqa: F401 - 注册 MySQL 告警回调
 from backend.db_monitor.views.callbacks import redis  # noqa: F401 - 注册 Redis 告警回调
@@ -46,6 +47,7 @@ from backend.iam_app.handlers.drf_perm.base import (
 from backend.iam_app.handlers.drf_perm.monitor import GlobalMonitorPolicyPermission
 from backend.iam_app.handlers.permission import Permission
 from backend.ticket.models import Ticket
+from backend.utils.trace import detached_root_span
 
 logger = logging.getLogger("root")
 
@@ -316,6 +318,23 @@ class MonitorPolicyViewSet(AuditedModelViewSet):
         return Response()
 
     @common_swagger_auto_schema(
+        operation_summary=_("查询策略阈值"),
+        tags=[constants.SWAGGER_TAG],
+        query_serializer=serializers.GetPolicyThreshold,
+    )
+    @action(
+        methods=["GET"],
+        detail=False,
+        serializer_class=serializers.GetPolicyThreshold,
+        pagination_class=None,
+        filter_class=None,
+    )
+    def get_policy_threshold(self, request, *args, **kwargs):
+        data = self.validated_data
+        result = get_policy_threshold(**data)
+        return Response(result)
+
+    @common_swagger_auto_schema(
         operation_summary=_("根据db类型查询集群列表"),
         tags=[constants.SWAGGER_TAG],
         query_serializer=serializers.ListClusterSerializer,
@@ -453,6 +472,7 @@ class MonitorPolicyViewSet(AuditedModelViewSet):
         serializer_class=serializers.MySQLAlarmCallbackDataSerializer,
         permission_classes=[AllowAny],
     )
+    @detached_root_span
     def alarm_callback(self, request, *args, **kwargs):
         # 处理套餐: dbm_alarm_http_callback. 定义在 ALARM_CALLBACK_ACTIONS
         logger.info("[alarm_callback] request data: %s", json.dumps(request.data))
@@ -495,6 +515,7 @@ class MonitorPolicyViewSet(AuditedModelViewSet):
         serializer_class=serializers.AlarmCallBackDataSerializer,
         permission_classes=[AllowAny],
     )
+    @detached_root_span
     def callback(self, request, *args, **kwargs):
         # 处理套餐: dbm_autofix_http_callback. 定义在 ALARM_CALLBACK_ACTIONS
         # 监控回调需要使用 Bearer Token 进行验证

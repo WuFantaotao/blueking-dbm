@@ -287,11 +287,11 @@ class TicketType(StrStructuredEnum):
     MYSQL_DTS_CLUSTER_APPLY = TicketEnumField("MYSQL_DTS_CLUSTER_APPLY", _("MySQL DTS 集群部署"))
     MYSQL_DTS_CLUSTER_DESTROY = TicketEnumField("MYSQL_DTS_CLUSTER_DESTROY", _("MySQL DTS 集群销毁"))
     MYSQL_DTS_CLUSTER_REINSTALL = TicketEnumField("MYSQL_DTS_CLUSTER_REINSTALL", _("MySQL DTS 集群重装"))
-    MYSQL_TO_MYSQL_MIGRATE = TicketEnumField("MYSQL_TO_MYSQL_MIGRATE", _("MySQL 数据迁移"), _("数据处理"))
+    MYSQL_DTS_DATA_MIGRATE = TicketEnumField("MYSQL_DTS_DATA_MIGRATE", _("MySQL DTS 同名迁移"), _("数据处理"))
     MYSQL_HA_TO_CLUSTER_MIGRATE = TicketEnumField(
         "MYSQL_HA_TO_CLUSTER_MIGRATE", _("MySQL HA到Cluster数据迁移"), _("数据处理")
     )
-    MYSQL_RENAME_MIGRATE = TicketEnumField("MYSQL_RENAME_MIGRATE", _("MySQL 重命名迁移"), _("数据处理"))
+    MYSQL_DTS_DATA_MIGRATE_RENAME = TicketEnumField("MYSQL_DTS_DATA_MIGRATE_RENAME", _("MySQL DTS 库改名迁移"), _("数据处理"))
     MYSQL_SINGLE_RENAME_DATABASE = TicketEnumField("MYSQL_SINGLE_RENAME_DATABASE", _("MySQL 单节点DB重命名"), _("集群维护"))  # noqa
     MYSQL_OPEN_AREA = TicketEnumField("MYSQL_OPEN_AREA", _("MySQL 开区"), _("克隆开区"))
     MYSQL_DATA_MIGRATE = TicketEnumField("MYSQL_DATA_MIGRATE", _("MySQL DB数据克隆"), _("克隆与开区"), register_iam=True)
@@ -634,7 +634,8 @@ class TicketType(StrStructuredEnum):
     MONGODB_DATA_EXPORT = TicketEnumField("MONGODB_DATA_EXPORT", _("MongoDB 数据导出"), _("数据处理"))
     MONGODB_ADD_MONGOS = TicketEnumField("MONGODB_ADD_MONGOS", _("MongoDB 扩容接入层"), _("集群维护"))
     MONGODB_REDUCE_MONGOS = TicketEnumField("MONGODB_REDUCE_MONGOS", _("MongoDB 缩容接入层"), _("集群维护"))
-    MONGODB_ADD_SHARD = TicketEnumField("MONGODB_ADD_SHARD", _("MongoDB 增加分片数"), _("集群维护"))
+    MONGODB_ADD_SHARD = TicketEnumField("MONGODB_ADD_SHARD", _("分片集群增加分片"), _("集群维护"))
+    MONGODB_REDUCE_SHARD = TicketEnumField("MONGODB_REDUCE_SHARD", _("分片集群减少分片"), _("集群维护"))
     MONGODB_SHARD_ADD_SHARD_NODES = TicketEnumField("MONGODB_SHARD_ADD_SHARD_NODES",
                                                     _("MongoDB 扩容分片集群shard节点数"), _("集群维护"))  # noqa
     MONGODB_REPLICA_ADD_SHARD_NODES = TicketEnumField("MONGODB_REPLICA_ADD_SHARD_NODES",
@@ -661,9 +662,19 @@ class TicketType(StrStructuredEnum):
     MONGODB_TEMPORARY_DESTROY = TicketEnumField("MONGODB_TEMPORARY_DESTROY", _("MongoDB 临时集群销毁"), _("集群维护"), register_iam=True)
     MONGODB_INSTALL_DBMON = TicketEnumField("MONGODB_INSTALL_DBMON", _("MongoDB 安装DBMon"), _("集群维护"))
     MONGODB_AUTOFIX = TicketEnumField("MONGODB_AUTOFIX", _("MongoDB 故障自愈"), _("集群维护"))
+    MONGODB_AUTOFIX_PRE = TicketEnumField("MONGODB_AUTOFIX_PRE", _("MongoDB 故障自愈确认"), _("集群维护"))
     MONGODB_INSTANCE_DEINSTALL = TicketEnumField("MONGODB_INSTANCE_DEINSTALL", _("MongoDB 实例下架"), _("集群维护"))
+    MONGODB_DEFERRED_DEINSTALL = TicketEnumField(
+        "MONGODB_DEFERRED_DEINSTALL", _("MongoDB 延迟下架"), _("集群维护")
+    )
     MONGODB_INSTANCE_FIX_STATUS = TicketEnumField("MONGODB_INSTANCE_FIX_STATUS", _("MongoDB 节点状态修复"),
                                                   _("集群维护"))
+    # 自愈 PRE(process_bad) 跟单；不挂工具箱入口（与 MONGODB_INSTANCE_RELOAD 分离）
+    MONGODB_INSTANCE_ENSURE_START = TicketEnumField(
+        "MONGODB_INSTANCE_ENSURE_START", _("MongoDB 进程拉起"), _("集群维护")
+    )
+    # 自愈 PRE(auth_error / gse_inconclusive) 显式跟单，便于人工跟踪；不挂工具箱
+    MONGODB_AUTOFIX_MANUAL = TicketEnumField("MONGODB_AUTOFIX_MANUAL", _("MongoDB 自愈人工处理"), _("集群维护"))
     MONGODB_CLUSTER_STANDARDIZE = TicketEnumField("MONGODB_CLUSTER_STANDARDIZE", _("MongoDB 集群标准化"))
     MONGODB_UPGRADE_VERSION = TicketEnumField("MONGODB_UPGRADE_VERSION", _("MongoDB 版本升级"))
     MONGODB_CHANGE_BIZ = TicketEnumField("MONGODB_CHANGE_BIZ", _("MongoDB 集群业务变更"), _("集群维护"))
@@ -735,6 +746,8 @@ class TicketType(StrStructuredEnum):
 
     # ORACLE
     ORACLE_EXEC_SCRIPT_APPLY = TicketEnumField("ORACLE_EXEC_SCRIPT_APPLY", _("ORACLE 变更SQL执行"), _("脚本任务"))
+    ORACLE_ADD_SLAVE = TicketEnumField("ORACLE_ADD_SLAVE", _("ORACLE 添加从库替换从库"), _("集群管理"))
+    ORACLE_ADD_SLAVE_VIA_CASCADING = TicketEnumField("ORACLE_ADD_SLAVE_VIA_CASCADING", _("ORACLE 添加从库替换从库"), _("集群管理"))
 
     # 测试
     FAKE_TICKET = TicketEnumField("FAKE_TICKET", _("测试专用单据"))

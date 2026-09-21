@@ -10,6 +10,7 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/format"
 
+	"dbm-services/common/go-pubpkg/cmutil"
 	"dbm-services/mysql/slow-query-parser-service/pkg/tiparser"
 )
 
@@ -43,7 +44,14 @@ func replaceMultiValuesWithCount(fingerprint string) (withComment, forHash strin
 // 计算指纹
 // 获取表名
 // 获取 sql 类型
-func AnalyzeSql(db, oneSql string) (*Response, error) {
+func AnalyzeSql(db, oneSql string) (resp *Response, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			// tidb parser test_driver 的 MyDecimal 实现在遇到特殊数值时会 panic，降级到 percona 解析
+			resp, err = parseByPercona(db, oneSql)
+		}
+	}()
+
 	stmts, _, err := parser.New().Parse(oneSql, "", "")
 	if err != nil {
 		return parseByPercona(db, oneSql) // percona 正则替换的方式
@@ -85,7 +93,7 @@ func AnalyzeSql(db, oneSql string) (*Response, error) {
 	// 生成两个版本：一个带注释（用于显示），一个不带注释（用于计算MD5）
 	fingerprintWithComment, fingerprintForHash := replaceMultiValuesWithCount(fingerprint)
 
-	resp := &Response{
+	resp = &Response{
 		QueryString: oneSql, // do not return original sql
 		// remove # Time:
 		QueryLength:     len(oneSql),
@@ -99,7 +107,7 @@ func AnalyzeSql(db, oneSql string) (*Response, error) {
 		}
 		resp.TableReferences = append(resp.TableReferences, ref)
 	}
-	resp.Command = strings.Join(sqlCommands.CommandName, ",")
+	resp.Command = strings.Join(cmutil.RemoveDuplicate(sqlCommands.CommandName), ",")
 	// fmt.Println("xxxx", resp.Command, resp.TableReferences)
 	// 优先取第一个表名
 	for _, dbt := range resp.TableReferences {

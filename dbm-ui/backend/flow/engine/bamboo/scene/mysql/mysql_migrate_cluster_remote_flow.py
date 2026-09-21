@@ -405,7 +405,7 @@ class MySQLMigrateClusterRemoteFlow(object):
                         act_name=MySQLCheckSumTicketResultComponent.node_name,
                         act_component_code=MySQLCheckSumTicketResultComponent.code,
                         kwargs={
-                            "bk_cloud_id": cluster_class.bk_cloud_id,
+                            "bk_cloud_id": cluster_model.bk_cloud_id,
                             "checksum_pairs": [
                                 {
                                     "master": master_model.ip_port,
@@ -471,7 +471,7 @@ class MySQLMigrateClusterRemoteFlow(object):
                     act_component_code=MysqlCrondMonitorControlComponent.code,
                     kwargs=asdict(
                         CrondMonitorKwargs(
-                            bk_cloud_id=cluster_class.bk_cloud_id,
+                            bk_cloud_id=cluster_model.bk_cloud_id,
                             exec_ips=[self.data["master_ip"], self.data["old_slave_ip"]],
                             name="dbbackup",
                             port=master_model.port,
@@ -594,6 +594,7 @@ class MySQLMigrateClusterRemoteFlow(object):
                     with_collect_sysinfo=False,
                     with_instance_standardize=False,
                     with_cc_standardize=False,
+                    with_probe=False,
                 )
             )
             # todo 添加checksum单据状态检查 、添加通过后添加checksum结果的查询
